@@ -42,6 +42,16 @@ enum ReceiveResult {
     NewStart,
 }
 
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum I2CDMAState {
+    Working,
+    WaitWritting,
+    WaitReloading,
+    WaitReading,
+    Starting,
+    ReadData
+}
+
 fn debug_print_interrupts(isr: stm32_metapac::i2c::regs::Isr) {
     if isr.tcr() {
         trace!("interrupt: tcr");
@@ -118,7 +128,7 @@ impl<'d, M: Mode, IM: MasterMode> I2c<'d, M, IM> {
         self.info.regs.cr2().write(|w| w.set_stop(true));
     }
 
-    fn master_read(
+    fn blocking_master_read(
         info: &'static Info,
         address: Address,
         length: usize,
@@ -161,7 +171,7 @@ impl<'d, M: Mode, IM: MasterMode> I2c<'d, M, IM> {
         Ok(())
     }
 
-    fn master_write(
+    fn blocking_master_write(
         info: &'static Info,
         address: Address,
         length: usize,
@@ -205,7 +215,7 @@ impl<'d, M: Mode, IM: MasterMode> I2c<'d, M, IM> {
         Ok(())
     }
 
-    fn reload(info: &'static Info, length: usize, will_reload: bool, timeout: Timeout) -> Result<(), Error> {
+    fn blocking_reload(info: &'static Info, length: usize, will_reload: bool, timeout: Timeout) -> Result<(), Error> {
         assert!(length < 256 && length > 0);
 
         while !info.regs.isr().read().tcr() {
@@ -386,7 +396,7 @@ impl<'d, M: Mode, IM: MasterMode> I2c<'d, M, IM> {
         };
         let last_chunk_idx = total_chunks.saturating_sub(1);
 
-        Self::master_read(
+        Self::blocking_master_read(
             self.info,
             address,
             read.len().min(255),
@@ -398,7 +408,7 @@ impl<'d, M: Mode, IM: MasterMode> I2c<'d, M, IM> {
 
         for (number, chunk) in read.chunks_mut(255).enumerate() {
             if number != 0 {
-                Self::reload(self.info, chunk.len(), number != last_chunk_idx, timeout)?;
+                Self::blocking_reload(self.info, chunk.len(), number != last_chunk_idx, timeout)?;
             }
 
             for byte in chunk {
@@ -430,7 +440,7 @@ impl<'d, M: Mode, IM: MasterMode> I2c<'d, M, IM> {
         // I2C start
         //
         // ST SAD+W
-        if let Err(err) = Self::master_write(
+        if let Err(err) = Self::blocking_master_write(
             self.info,
             address,
             write.len().min(255),
@@ -446,7 +456,7 @@ impl<'d, M: Mode, IM: MasterMode> I2c<'d, M, IM> {
 
         for (number, chunk) in write.chunks(255).enumerate() {
             if number != 0 {
-                Self::reload(self.info, chunk.len(), number != last_chunk_idx, timeout)?;
+                Self::blocking_reload(self.info, chunk.len(), number != last_chunk_idx, timeout)?;
             }
 
             for byte in chunk {
@@ -520,7 +530,7 @@ impl<'d, M: Mode, IM: MasterMode> I2c<'d, M, IM> {
         let first_length = write[0].len();
         let last_slice_index = write.len() - 1;
 
-        if let Err(err) = Self::master_write(
+        if let Err(err) = Self::blocking_master_write(
             self.info,
             address.into(),
             first_length.min(255),
@@ -543,7 +553,7 @@ impl<'d, M: Mode, IM: MasterMode> I2c<'d, M, IM> {
             let last_chunk_idx = total_chunks.saturating_sub(1);
 
             if idx != 0 {
-                if let Err(err) = Self::reload(
+                if let Err(err) = Self::blocking_reload(
                     self.info,
                     slice_len.min(255),
                     (idx != last_slice_index) || (slice_len > 255),
@@ -558,7 +568,7 @@ impl<'d, M: Mode, IM: MasterMode> I2c<'d, M, IM> {
 
             for (number, chunk) in slice.chunks(255).enumerate() {
                 if number != 0 {
-                    if let Err(err) = Self::reload(
+                    if let Err(err) = Self::blocking_reload(
                         self.info,
                         chunk.len(),
                         (number != last_chunk_idx) || (idx != last_slice_index),
@@ -598,6 +608,7 @@ impl<'d, M: Mode, IM: MasterMode> I2c<'d, M, IM> {
 }
 
 impl<'d, IM: MasterMode> I2c<'d, Async, IM> {
+
     async fn write_dma_internal(
         &mut self,
         address: Address,
@@ -645,53 +656,113 @@ impl<'d, IM: MasterMode> I2c<'d, Async, IM> {
             });
         });
 
+        let mut state = I2CDMAState::Starting;
+        let mut will_reload = false;
+        let mut length_for_reload = 0;
+        let mut wait_for_start_clear = true;
+
         poll_fn(|cx| {
             self.state.waker.register(cx.waker());
 
             let isr = self.info.regs.isr().read();
 
-            if isr.nackf() {
-                return Poll::Ready(Err(Error::Nack));
-            }
-            if isr.arlo() {
-                return Poll::Ready(Err(Error::Arbitration));
-            }
-            if isr.berr() {
-                return Poll::Ready(Err(Error::Bus));
-            }
-            if isr.ovr() {
-                return Poll::Ready(Err(Error::Overrun));
-            }
+            Self::check_errors(&isr)?;
 
-            if remaining_len == total_len {
-                if first_slice {
-                    Self::master_write(
-                        self.info,
-                        address,
-                        total_len.min(255),
-                        Stop::Software,
-                        (total_len > 255) || !last_slice,
-                        timeout,
-                    )?;
-                } else {
-                    Self::reload(self.info, total_len.min(255), (total_len > 255) || !last_slice, timeout)?;
+            match state {
+                I2CDMAState::Starting => {
+                    if remaining_len == total_len {
+                        state = I2CDMAState::WaitWritting;
+                    } else {
+                        state = I2CDMAState::WaitReloading;
+                        will_reload = !(total_len > 255) || !last_slice;
+                        length_for_reload = total_len.min(255);
+                    }
+                }
+                I2CDMAState::Working => {
+                    if !(isr.tcr() || isr.tc()) {
+                        // poll_fn was woken without an interrupt present
+                        return Poll::Pending;
+                    } else if remaining_len == 0 {
+                        return Poll::Ready(Ok(()));
+                    } else {
+                        will_reload = (remaining_len <= 255) && last_slice;
+                        length_for_reload = remaining_len.min(255);
+                        state = I2CDMAState::WaitReloading;
+                    }
+ 
+                    remaining_len = remaining_len.saturating_sub(255); // check if this action should be after reload
+                }
+                I2CDMAState::WaitWritting => {
+                    // Wait for any previous address sequence to end
+                    // automatically. This could be up to 50% of a bus
+                    // cycle (ie. up to 0.5/freq)
+                    if wait_for_start_clear {
+                        if !self.info.regs.cr2().read().start() {
+                            wait_for_start_clear = false;
+                        } else if let Err(e) = timeout.check() {
+                            return Poll::Ready(Err(e));
+                        } else {
+                            return Poll::Pending;
+                        }
+                    } 
+                    
+                    // Wait for the bus to be free
+                    if !wait_for_start_clear{
+                        if !self.info.regs.isr().read().busy() {
+                            state = I2CDMAState::Working;
+                            wait_for_start_clear = true;
+                        } else if let Err(e) = timeout.check() {
+                            return Poll::Ready(Err(e));
+                        }else {
+                            return Poll::Pending;
+                        }
+                    }  
+
+                    let reload = if (total_len > 255) || !last_slice {
+                        i2c::vals::Reload::NOT_COMPLETED
+                    } else {
+                        i2c::vals::Reload::COMPLETED
+                    };
+                    // Set START and prepare to send `bytes`. The
+                    // START bit can be set even if the bus is BUSY or
+                    // I2C is in slave mode.
+                    self.info.regs.cr2().modify(|w| {
+                        w.set_sadd(address.addr() << 1);
+                        w.set_add10(address.add_mode());
+                        w.set_dir(i2c::vals::Dir::WRITE);
+                        w.set_nbytes(total_len.min(255) as u8);
+                        w.set_start(true);
+                        w.set_autoend(Stop::Software.autoend());
+                        w.set_reload(reload);
+                    });
+                }
+                I2CDMAState::WaitReloading => {
+                    if self.info.regs.isr().read().tcr() {
+                        state = I2CDMAState::Working;
+                    } else if let Err(e) = timeout.check() {
+                        return Poll::Ready(Err(e));
+                    } else {
+                        return Poll::Pending;
+                    }
+
+                    let reload = if will_reload {
+                        i2c::vals::Reload::NOT_COMPLETED
+                    } else {
+                        i2c::vals::Reload::COMPLETED
+                    };
+
+                    self.info.regs.cr2().modify(|w| {
+                    w.set_nbytes(length_for_reload as u8);
+                    w.set_reload(reload);
+                    });
                     self.info.regs.cr1().modify(|w| w.set_tcie(true));
+                    will_reload = false;
+                    length_for_reload = 0;
                 }
-            } else if !(isr.tcr() || isr.tc()) {
-                // poll_fn was woken without an interrupt present
-                return Poll::Pending;
-            } else if remaining_len == 0 {
-                return Poll::Ready(Ok(()));
-            } else {
-                let last_piece = (remaining_len <= 255) && last_slice;
-
-                if let Err(e) = Self::reload(self.info, remaining_len.min(255), !last_piece, timeout) {
-                    return Poll::Ready(Err(e));
+                _ => {
+                    state = I2CDMAState::Working;
                 }
-                self.info.regs.cr1().modify(|w| w.set_tcie(true));
-            }
-
-            remaining_len = remaining_len.saturating_sub(255);
+            };
             Poll::Pending
         })
         .await?;
@@ -751,55 +822,111 @@ impl<'d, IM: MasterMode> I2c<'d, Async, IM> {
             });
         });
 
+        let mut state = I2CDMAState::Starting;
+        let mut last_piece = false;
+        let mut length_for_reload = 0;
+
         poll_fn(|cx| {
             self.state.waker.register(cx.waker());
 
-            let isr = self.info.regs.isr().read();
+            let isr: i2c::regs::Isr = self.info.regs.isr().read();
 
-            if isr.nackf() {
-                return Poll::Ready(Err(Error::Nack));
-            }
-            if isr.arlo() {
-                return Poll::Ready(Err(Error::Arbitration));
-            }
-            if isr.berr() {
-                return Poll::Ready(Err(Error::Bus));
-            }
-            if isr.ovr() {
-                return Poll::Ready(Err(Error::Overrun));
-            }
+            Self::check_errors(&isr)?;
 
-            if remaining_len == total_len {
-                Self::master_read(
-                    self.info,
-                    address,
-                    total_len.min(255),
-                    Stop::Automatic,
-                    total_len > 255,
-                    restart,
-                    timeout,
-                )?;
-                if total_len <= 255 {
-                    return Poll::Ready(Ok(()));
+            match state {
+                I2CDMAState::Starting => {
+                    if remaining_len == total_len {
+                        state = I2CDMAState::WaitReading;
+                    } else {
+                        state = I2CDMAState::Working;
+                    }
                 }
-            } else if isr.tcr() {
-                // poll_fn was woken without an interrupt present
-                return Poll::Pending;
-            } else {
-                let last_piece = remaining_len <= 255;
-
-                if let Err(e) = Self::reload(self.info, remaining_len.min(255), !last_piece, timeout) {
-                    return Poll::Ready(Err(e));
+                I2CDMAState::Working => {
+                    if isr.tcr() {
+                        // poll_fn was woken without an interrupt present
+                        return Poll::Pending;
+                    } else {
+                        last_piece = remaining_len <= 255;
+                        length_for_reload = remaining_len.min(255);
+                        state = I2CDMAState::WaitReloading;
+                    }
+ 
+                    remaining_len = remaining_len.saturating_sub(255);
                 }
-                // Return here if we are on last chunk,
-                // end of transfer will be awaited with the DMA below
-                if last_piece {
-                    return Poll::Ready(Ok(()));
-                }
-                self.info.regs.cr1().modify(|w| w.set_tcie(true));
-            }
+                I2CDMAState::WaitReading => {
+                    if !restart {
+                        // Wait for any previous address sequence to end
+                        // automatically. This could be up to 50% of a bus
+                        // cycle (ie. up to 0.5/freq)
+                        if !self.info.regs.cr2().read().start() {
+                            state = I2CDMAState::Working;
+                        } else if let Err(e) = timeout.check() {
+                            return Poll::Ready(Err(e));
+                        } else {
+                            return Poll::Pending;
+                        } 
+                    }
+                    // Set START and prepare to receive bytes into
+                    // `buffer`. The START bit can be set even if the bus
+                    // is BUSY or I2C is in slave mode.
 
-            remaining_len = remaining_len.saturating_sub(255);
+                    let reload = if total_len > 255 {
+                        i2c::vals::Reload::NOT_COMPLETED
+                    } else {
+                        i2c::vals::Reload::COMPLETED
+                    };
+
+                    self.info.regs.cr2().modify(|w| {
+                        w.set_sadd(address.addr() << 1);
+                        w.set_add10(address.add_mode());
+                        w.set_dir(i2c::vals::Dir::READ);
+                        w.set_nbytes(total_len.min(255) as u8);
+                        w.set_start(true);
+                        w.set_autoend(Stop::Automatic.autoend());
+                        w.set_reload(reload);
+                    });
+
+                    if total_len <= 255 {
+                        return Poll::Ready(Ok(()));
+                    }
+                }
+                I2CDMAState::WaitReloading => {
+                    if self.info.regs.isr().read().tcr() {
+                        state = I2CDMAState::ReadData;
+                    } else if let Err(e) = timeout.check() {
+                        return Poll::Ready(Err(e));
+                    } else {
+                        return Poll::Pending;
+                    }
+
+                    let reload = if last_piece {
+                        i2c::vals::Reload::NOT_COMPLETED
+                    } else {
+                        i2c::vals::Reload::COMPLETED
+                    };
+
+                    self.info.regs.cr2().modify(|w| {
+                    w.set_nbytes(length_for_reload as u8);
+                    w.set_reload(reload);
+                    });
+                    self.info.regs.cr1().modify(|w| w.set_tcie(true));
+                    last_piece = false;
+                    length_for_reload = 0;
+                }
+                I2CDMAState::ReadData => {
+                    if remaining_len <= 255 {
+                        return Poll::Ready(Ok(()));
+                    }
+                    self.info.regs.cr1().modify(|w: &mut i2c::regs::Cr1| w.set_tcie(true));
+ 
+                    remaining_len = remaining_len.saturating_sub(255);
+                    state = I2CDMAState::Working;
+                }
+                _ => {
+                    state = I2CDMAState::Working;
+                }
+            };
+
             Poll::Pending
         })
         .await?;
@@ -809,6 +936,23 @@ impl<'d, IM: MasterMode> I2c<'d, Async, IM> {
 
         Ok(())
     }
+
+    fn check_errors(isr: &i2c::regs::Isr) -> Result<(), Error> {
+        if isr.nackf() {
+            return Err(Error::Nack);
+        }
+        if isr.arlo() {
+            return Err(Error::Arbitration);
+        }
+        if isr.berr() {
+            return Err(Error::Bus);
+        }
+        if isr.ovr() {
+            return Err(Error::Overrun);
+        }
+        return Ok(());
+    }
+
     // =========================
     //  Async public API
 
@@ -827,7 +971,7 @@ impl<'d, IM: MasterMode> I2c<'d, Async, IM> {
     /// Write multiple buffers.
     ///
     /// The buffers are concatenated in a single write transaction.
-    pub async fn write_vectored(&mut self, address: Address, write: &[&[u8]]) -> Result<(), Error> {
+    pub async fn write_vectored(&mut self, address: Address, write: &[&[u8]]) -> Result<(), Error> { //
         let timeout = self.timeout();
 
         if write.is_empty() {
@@ -846,7 +990,7 @@ impl<'d, IM: MasterMode> I2c<'d, Async, IM> {
             first = false;
             current = next;
         }
-        Ok(())
+        Ok(()) //
     }
 
     /// Read.
@@ -1028,7 +1172,7 @@ impl<'d, M: Mode> I2c<'d, M, MultiMaster> {
             if number == 0 {
                 Self::slave_start(self.info, chunk.len(), number != last_chunk_idx);
             } else {
-                Self::reload(self.info, chunk.len(), number != last_chunk_idx, timeout)?;
+                Self::blocking_reload(self.info, chunk.len(), number != last_chunk_idx, timeout)?;
             }
 
             let mut index = 0;
@@ -1077,7 +1221,7 @@ impl<'d, M: Mode> I2c<'d, M, MultiMaster> {
             if number == 0 {
                 Self::slave_start(self.info, chunk.len(), number != last_chunk_idx);
             } else {
-                Self::reload(self.info, chunk.len(), number != last_chunk_idx, timeout)?;
+                Self::blocking_reload(self.info, chunk.len(), number != last_chunk_idx, timeout)?;
             }
 
             let mut index = 0;
@@ -1213,7 +1357,7 @@ impl<'d> I2c<'d, Async, MultiMaster> {
                 Poll::Pending
             } else if isr.tcr() {
                 let is_last_slice = remaining_len <= 255;
-                if let Err(e) = Self::reload(self.info, remaining_len.min(255), !is_last_slice, timeout) {
+                if let Err(e) = Self::blocking_reload(self.info, remaining_len.min(255), !is_last_slice, timeout) {
                     return Poll::Ready(Err(e));
                 }
                 remaining_len = remaining_len.saturating_sub(255);
@@ -1274,7 +1418,7 @@ impl<'d> I2c<'d, Async, MultiMaster> {
                 Poll::Pending
             } else if isr.tcr() {
                 let is_last_slice = remaining_len <= 255;
-                if let Err(e) = Self::reload(self.info, remaining_len.min(255), !is_last_slice, timeout) {
+                if let Err(e) = Self::blocking_reload(self.info, remaining_len.min(255), !is_last_slice, timeout) {
                     return Poll::Ready(Err(e));
                 }
                 remaining_len = remaining_len.saturating_sub(255);
