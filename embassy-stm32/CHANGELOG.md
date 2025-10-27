@@ -169,6 +169,7 @@ I2C:
 - Ensure bus is free before master-write operation ([#3104](https://github.com/embassy-rs/embassy/pull/3104))
 - Add workaround for STM32 i2cv1 errata ([#2887](https://github.com/embassy-rs/embassy/pull/2887))
 - Fix disabling pullup accidentally enabling pulldown ([#3410](https://github.com/embassy-rs/embassy/pull/3410))
+- Made async calls non blocking ([#2299](https://github.com/weinmann-emt/embassy/pull/1))
 
 Flash:
 - Add L5 support ([#3423](https://github.com/embassy-rs/embassy/pull/3423))
