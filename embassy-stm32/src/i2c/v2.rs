@@ -737,7 +737,7 @@ impl<'d, IM: MasterMode> I2c<'d, Async, IM> {
                 }
                 I2CDMAState::WaitReloading => {
                     if self.info.regs.isr().read().tcr() {
-                        state = I2CDMAState::Working;
+                        state = I2CDMAState::WriteData;
                     } else if let Err(e) = timeout.check() {
                         return Poll::Ready(Err(e));
                     } else {
