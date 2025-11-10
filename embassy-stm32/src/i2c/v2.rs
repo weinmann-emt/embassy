@@ -49,7 +49,8 @@ enum I2CDMAState {
     WaitReloading,
     WaitReading,
     Starting,
-    ReadData
+    WriteData,
+    ReadData,
 }
 
 fn debug_print_interrupts(isr: stm32_metapac::i2c::regs::Isr) {
@@ -689,8 +690,6 @@ impl<'d, IM: MasterMode> I2c<'d, Async, IM> {
                         length_for_reload = remaining_len.min(255);
                         state = I2CDMAState::WaitReloading;
                     }
- 
-                    remaining_len = remaining_len.saturating_sub(255); // check if this action should be after reload
                 }
                 I2CDMAState::WaitWritting => {
                     // Wait for any previous address sequence to end
@@ -758,6 +757,15 @@ impl<'d, IM: MasterMode> I2c<'d, Async, IM> {
                     self.info.regs.cr1().modify(|w| w.set_tcie(true));
                     will_reload = false;
                     length_for_reload = 0;
+                }
+                I2CDMAState::WriteData => {
+                    if remaining_len == 0 {
+                        return Poll::Ready(Ok(()));
+                    }
+                    self.info.regs.cr1().modify(|w: &mut i2c::regs::Cr1| w.set_tcie(true));
+ 
+                    remaining_len = remaining_len.saturating_sub(255);
+                    state = I2CDMAState::Working;
                 }
                 _ => {
                     state = I2CDMAState::Working;
